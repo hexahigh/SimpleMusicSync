@@ -10,14 +10,18 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+	"unicode"
 )
 
 type optionsType struct {
 	sourceDir             string
 	targetDir             string
 	targetAudioExtension  string
+	targetImageExtension  string
 	sourceAudioExtensions []string
-	ffmpegCommand         string
+	sourceImageExtensions []string
+	ffmpegAudioCommand    string
+	ffmpegImageCommand    string
 	deleteRemovedFiles    bool
 }
 
@@ -35,22 +39,28 @@ type syncDB struct {
 }
 
 func main() {
-	sourceDir := flag.String("source", "", "Source music directory")
-	targetDir := flag.String("target", "", "Target directory (e.g., iPod)")
-	targetAudioExtension := flag.String("target-extension", "opus", "Extension for target audio files")
-	sourceExtensions := flag.String("source-extensions", "mp3,flac,opus", "Comma-separated list of extensions to transcode from")
-	ffmpegCommand := flag.String("ffmpeg-audio", "", "FFmpeg command template (use $INPUT and $OUTPUT for paths)")
-	deleteRemovedFiles := flag.Bool("delete-removed", false, "Delete files in target not present in source")
+	sourceDir := flag.String("source", "", "Source directory")
+	targetDir := flag.String("target", "", "Target directory")
+	targetAudioExt := flag.String("target-audio-extension", "opus", "Extension for converted audio")
+	targetImageExt := flag.String("target-image-extension", "jpeg", "Extension for converted images")
+	sourceAudioExts := flag.String("source-audio-extensions", "mp3,flac,opus", "Comma-separated audio extensions")
+	sourceImageExts := flag.String("source-image-extensions", "jpg,jpeg,png,gif", "Comma-separated image extensions")
+	ffmpegAudio := flag.String("ffmpeg-audio", "", "FFmpeg command template for audio")
+	ffmpegImage := flag.String("ffmpeg-image", "", "FFmpeg command template for images")
+	deleteRemoved := flag.Bool("delete-removed", false, "Delete files in target not present in source")
 
 	flag.Parse()
 
 	options = optionsType{
 		sourceDir:             *sourceDir,
 		targetDir:             *targetDir,
-		targetAudioExtension:  *targetAudioExtension,
-		sourceAudioExtensions: strings.Split(*sourceExtensions, ","),
-		ffmpegCommand:         *ffmpegCommand,
-		deleteRemovedFiles:    *deleteRemovedFiles,
+		targetAudioExtension:  *targetAudioExt,
+		targetImageExtension:  *targetImageExt,
+		sourceAudioExtensions: strings.Split(*sourceAudioExts, ","),
+		sourceImageExtensions: strings.Split(*sourceImageExts, ","),
+		ffmpegAudioCommand:    *ffmpegAudio,
+		ffmpegImageCommand:    *ffmpegImage,
+		deleteRemovedFiles:    *deleteRemoved,
 	}
 
 	if options.sourceDir == "" || options.targetDir == "" {
@@ -74,13 +84,30 @@ func main() {
 	var newDB syncDB
 
 	err := filepath.Walk(options.sourceDir, func(sourcePath string, info os.FileInfo, err error) error {
-		if err != nil || info.IsDir() || !isSourceExtension(filepath.Ext(sourcePath)) {
+		if err != nil || info.IsDir() {
 			return err
 		}
 
+		ext := strings.TrimPrefix(strings.ToLower(filepath.Ext(sourcePath)), ".")
+		isAudio := isAudioExtension(ext)
+		isImage := isImageExtension(ext)
+
+		if !isAudio && !isImage {
+			return nil
+		}
+
 		relPath, _ := filepath.Rel(options.sourceDir, sourcePath)
-		ext := filepath.Ext(sourcePath)
-		targetFile := filepath.Join(options.targetDir, strings.TrimSuffix(relPath, ext)+"."+options.targetAudioExtension)
+		targetExt := options.targetAudioExtension
+		ffmpegCmd := options.ffmpegAudioCommand
+
+		if isImage {
+			targetExt = options.targetImageExtension
+			ffmpegCmd = options.ffmpegImageCommand
+		}
+
+		targetFile := filepath.Join(
+			options.targetDir,
+			strings.TrimSuffix(relPath, filepath.Ext(sourcePath))+"."+targetExt)
 		relTargetPath, _ := filepath.Rel(options.targetDir, targetFile)
 
 		var existingEntry *SyncDBEntry
@@ -99,15 +126,22 @@ func main() {
 
 		if needsProcessing {
 			os.MkdirAll(filepath.Dir(targetFile), 0755)
-			if options.ffmpegCommand != "" {
-				cmdStr := strings.ReplaceAll(options.ffmpegCommand, "$INPUT", fmt.Sprintf("\"%s\"", sourcePath))
-				cmdStr = strings.ReplaceAll(cmdStr, "$OUTPUT", fmt.Sprintf("\"%s\"", targetFile))
-				cmd := exec.Command("bash", "-c", cmdStr)
-				if output, err := cmd.CombinedOutput(); err != nil {
-					fmt.Printf("Error transcoding %s: %v\nOutput: %s\n", sourcePath, err, string(output))
+			if ffmpegCmd != "" {
+				args, err := parseCommandTemplate(ffmpegCmd, sourcePath, targetFile)
+				if err != nil {
+					fmt.Printf("Error parsing ffmpeg command: %v\n", err)
 					return err
 				}
-				fmt.Printf("Transcoded: %s → %s\n", sourcePath, targetFile)
+				if len(args) == 0 {
+					fmt.Printf("Empty ffmpeg command for %s\n", sourcePath)
+					return nil
+				}
+				cmd := exec.Command(args[0], args[1:]...)
+				if output, err := cmd.CombinedOutput(); err != nil {
+					fmt.Printf("Error processing %s: %v\nOutput: %s\n", sourcePath, err, string(output))
+					return err
+				}
+				fmt.Printf("Processed: %s\n", relPath)
 			} else if err := copyFile(sourcePath, targetFile); err != nil {
 				fmt.Printf("Error copying %s: %v\n", sourcePath, err)
 				return err
@@ -154,9 +188,93 @@ func main() {
 	fmt.Println("Sync complete!")
 }
 
-func isSourceExtension(ext string) bool {
-	ext = strings.TrimPrefix(strings.ToLower(ext), ".")
+func parseCommandTemplate(template string, inputPath string, outputPath string) ([]string, error) {
+	args := splitCommand(template)
+	for i, arg := range args {
+		arg = strings.ReplaceAll(arg, "$INPUT", inputPath)
+		arg = strings.ReplaceAll(arg, "$OUTPUT", outputPath)
+		args[i] = arg
+	}
+	return args, nil
+}
+
+// splitCommand splits a command string into a slice of arguments, taking into account
+// quoted substrings and escape sequences. It handles single quotes ('), double quotes ("),
+// and backslashes (\) for escaping characters.
+//
+// Parameters:
+//   - cmd: The command string to be split.
+//
+// Returns:
+//   - A slice of strings, where each element represents an argument from the command string.
+//
+// Behavior:
+//   - Quoted substrings are treated as a single argument, preserving spaces within the quotes.
+//   - Escape sequences (e.g., \') are resolved, and the escaped character is included in the output.
+//   - Whitespace outside of quotes is treated as a delimiter between arguments.
+//   - Empty arguments are ignored unless explicitly quoted or escaped.
+func splitCommand(cmd string) []string {
+	var args []string
+	var current strings.Builder
+	var inQuote rune
+	var escape bool
+
+	for _, r := range cmd {
+		if escape {
+			current.WriteRune(r)
+			escape = false
+			continue
+		}
+
+		switch r {
+		case '\\':
+			escape = true
+		case '\'', '"':
+			if inQuote == 0 {
+				inQuote = r
+			} else if inQuote == r {
+				inQuote = 0
+			} else {
+				current.WriteRune(r)
+			}
+		case ' ', '\t', '\n', '\r':
+			if inQuote == 0 {
+				if current.Len() > 0 || !unicode.IsSpace(r) {
+					args = append(args, current.String())
+					current.Reset()
+				}
+			} else {
+				current.WriteRune(r)
+			}
+		default:
+			current.WriteRune(r)
+		}
+	}
+
+	if current.Len() > 0 {
+		args = append(args, current.String())
+	}
+
+	return args
+}
+
+// isAudioExtension checks if the given file extension matches any of the
+// audio file extensions specified in the sourceAudioExtensions slice.
+// The comparison is case-insensitive.
+func isAudioExtension(ext string) bool {
 	for _, e := range options.sourceAudioExtensions {
+		if strings.EqualFold(ext, e) {
+			return true
+		}
+	}
+	return false
+}
+
+// isImageExtension checks if the given file extension matches any of the
+// image file extensions specified in the sourceImageExtensions slice.
+// The comparison is case-insensitive.
+func isImageExtension(ext string) bool {
+	for _, e := range options.sourceImageExtensions {
 		if strings.EqualFold(ext, e) {
 			return true
 		}
