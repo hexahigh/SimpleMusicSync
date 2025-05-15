@@ -2,15 +2,17 @@ package main
 
 import (
 	"encoding/json"
-	"flag"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 	"unicode"
+
+	flag "github.com/spf13/pflag"
 )
 
 type optionsType struct {
@@ -23,6 +25,8 @@ type optionsType struct {
 	ffmpegAudioCommand    string
 	ffmpegImageCommand    string
 	deleteRemovedFiles    bool
+	excludes              []string
+	includes              []string
 }
 
 var options optionsType
@@ -49,6 +53,8 @@ func main() {
 	ffmpegAudio := flag.String("ffmpeg-audio", "", "FFmpeg command template for audio")
 	ffmpegImage := flag.String("ffmpeg-image", "", "FFmpeg command template for images")
 	deleteRemoved := flag.Bool("delete-removed", false, "Delete files in target not present in source")
+	excludes := flag.StringArray("exclude", []string{}, "Exclude files matching this regex pattern (checked against the relative path) (can be used multiple times)")
+	includes := flag.StringArray("include", []string{}, "Include files matching this regex pattern (overrides excludes) (can be used multiple times)")
 
 	flag.Parse()
 
@@ -62,6 +68,8 @@ func main() {
 		ffmpegAudioCommand:    *ffmpegAudio,
 		ffmpegImageCommand:    *ffmpegImage,
 		deleteRemovedFiles:    *deleteRemoved,
+		excludes:              *excludes,
+		includes:              *includes,
 	}
 
 	if options.sourceDir == "" || options.targetDir == "" {
@@ -98,6 +106,12 @@ func main() {
 		}
 
 		relPath, _ := filepath.Rel(options.sourceDir, sourcePath)
+
+		if len(options.excludes) != 0 && shouldExclude(relPath, options.excludes, options.includes) {
+			fmt.Printf("Skipping (excluded): %s\n", relPath)
+			return nil
+		}
+
 		targetExt := options.targetAudioExtension
 		ffmpegCmd := options.ffmpegAudioCommand
 
@@ -135,21 +149,21 @@ func main() {
 					return err
 				}
 				if len(args) == 0 {
-					fmt.Printf("Empty ffmpeg command for %s\n", sourcePath)
+					fmt.Printf("Empty ffmpeg command for %s\n", relPath)
 					return nil
 				}
 				cmd := exec.Command(args[0], args[1:]...)
 				if output, err := cmd.CombinedOutput(); err != nil {
-					fmt.Printf("Error processing %s: %v\nOutput: %s\n", sourcePath, err, string(output))
+					fmt.Printf("Error processing %s: %v\nOutput: %s\n", relPath, err, string(output))
 					return err
 				}
 				fmt.Printf("Processed: %s\n", relPath)
 			} else if err := copyFile(sourcePath, targetFile); err != nil {
-				fmt.Printf("Error copying %s: %v\n", sourcePath, err)
+				fmt.Printf("Error copying %s: %v\n", relPath, err)
 				return err
 			}
 		} else {
-			fmt.Printf("Skipping (up-to-date): %s\n", sourcePath)
+			fmt.Printf("Skipping (up-to-date): %s\n", relPath)
 		}
 
 		newDB.Entries = append(newDB.Entries, SyncDBEntry{
@@ -307,6 +321,31 @@ func copyFile(src, dst string) error {
 		return err
 	}
 	return out.Sync()
+}
+
+func shouldExclude(path string, excludes, includes []string) bool {
+	result := false
+	for _, pattern := range excludes {
+		if pattern == "" {
+			continue
+		}
+		matched, _ := regexp.MatchString(pattern, path)
+		if matched {
+			result = true
+			break
+		}
+	}
+
+	// Includes override excludes
+	for _, pattern := range includes {
+		matched, _ := regexp.MatchString(pattern, path)
+		if matched {
+			result = false
+			break
+		}
+	}
+
+	return result
 }
 
 func (db *syncDB) Load(path string) {
