@@ -32,6 +32,7 @@ type SyncDBEntry struct {
 	TargetPath string    `json:"targetPath"`
 	Size       int64     `json:"size"`
 	ModTime    time.Time `json:"modTime"`
+	Command    string    `json:"command"`
 }
 
 type syncDB struct {
@@ -121,6 +122,7 @@ func main() {
 		sourceInfo, _ := os.Stat(sourcePath)
 		needsProcessing := existingEntry == nil ||
 			existingEntry.Size != sourceInfo.Size() ||
+			existingEntry.Command != ffmpegCmd ||
 			!existingEntry.ModTime.Equal(sourceInfo.ModTime()) ||
 			!fileExists(targetFile)
 
@@ -155,6 +157,7 @@ func main() {
 			TargetPath: relTargetPath,
 			Size:       sourceInfo.Size(),
 			ModTime:    sourceInfo.ModTime(),
+			Command:    ffmpegCmd,
 		})
 		return nil
 	})
